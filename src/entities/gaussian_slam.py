@@ -7,15 +7,15 @@ from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from src.entities.arguments import OptimizationParams
+from src.entities.cameras import BaseCamera
 from src.entities.datasets import get_dataset
 from src.entities.gaussian_model import GaussianModel
+from src.entities.logger import Logger
 from src.entities.mapper import Mapper
 from src.entities.tracker import Tracker
-from src.entities.logger import Logger
 from src.utils.io_utils import save_dict_to_ckpt, save_dict_to_yaml
 from src.utils.mapper_utils import exceeds_motion_thresholds
 from src.utils.utils import np2torch, setup_seed, torch2np
@@ -54,9 +54,11 @@ class GaussianSLAM(object):
             self.new_submap_frame_ids = frame_ids[::config["mapping"]["new_submap_every"]] + [n_frames - 1]
             self.new_submap_frame_ids.pop(0)
 
+        self.camera = BaseCamera(config["cam"])
         self.logger = Logger(self.output_path, config["use_wandb"])
-        self.mapper = Mapper(config["mapping"], self.dataset, self.logger)
-        self.tracker = Tracker(config["tracking"], self.dataset, self.logger)
+        self.mapper = Mapper(config["mapping"], self.camera, self.dataset, self.logger)
+        self.tracker = Tracker(config["tracking"], self.camera, self.dataset, self.logger)
+        self.gaussian_model = None
 
         print('Tracking config')
         pprint.PrettyPrinter().pprint(config["tracking"])
@@ -157,3 +159,46 @@ class GaussianSLAM(object):
                     "opt_dict": opt_dict
                 }
         save_dict_to_ckpt(self.estimated_c2ws[:frame_id + 1], "estimated_c2w.ckpt", directory=self.output_path)
+        
+        
+    def init_scene(self):
+        """ Initializes the scene for visualization. """
+        setup_seed(self.config["seed"])
+        self.gaussian_model = GaussianModel(0)
+        self.gaussian_model.training_setup(self.opt)
+        self.submap_id = 0
+        self.current_frame_idx = 0
+        
+    def run_inference(self, image: np.array, depth: np.array) -> np.ndarray:
+        """ Starts the main program flow for Gaussian-SLAM, including tracking and mapping. """
+        setup_seed(self.config["seed"])
+        gaussian_model = GaussianModel(0)
+        gaussian_model.training_setup(self.opt)
+        self.submap_id = 0
+
+        if self.current_frame_idx in [0, 1]:
+            estimated_c2w = np.zeros((4,4))
+        else:
+            estimated_c2w = self.tracker.track_inference(
+                image,
+                depth,
+                gaussian_model,
+                torch2np(self.estimated_c2ws[torch.tensor([0, self.current_frame_idx - 2, self.current_frame_idx - 1])]))
+        self.estimated_c2ws[self.current_frame_idx] = np2torch(estimated_c2w)
+        # Reinitialize gaussian model for new segment
+        if self.should_start_new_submap(self.current_frame_idx):
+            save_dict_to_ckpt(self.estimated_c2ws[:self.current_frame_idx + 1], "estimated_c2w.ckpt", directory=self.output_path)
+            gaussian_model = self.start_new_submap(self.current_frame_idx, gaussian_model)
+        estimate_c2w = torch2np(self.estimated_c2ws[self.current_frame_idx])
+        if self.current_frame_idx in self.mapping_frame_ids:
+            print("\nMapping frame", self.current_frame_idx)
+            gaussian_model.training_setup(self.opt)
+            estimate_c2w = torch2np(self.estimated_c2ws[self.current_frame_idx])
+            new_submap = not bool(self.keyframes_info)
+            opt_dict = self.mapper.map(self.current_frame_idx, estimate_c2w, gaussian_model, new_submap)
+            # Keyframes info update
+            self.keyframes_info[self.current_frame_idx] = {
+                "keyframe_id": len(self.keyframes_info.keys()),
+                "opt_dict": opt_dict
+            }
+        return estimate_c2w

@@ -7,23 +7,33 @@ import torch
 import torchvision
 
 from src.entities.arguments import OptimizationParams
-from src.entities.datasets import TUM_RGBD, BaseDataset, ScanNet
+from src.entities.cameras import BaseCamera
+from src.entities.datasets import BaseDataset
 from src.entities.gaussian_model import GaussianModel
 from src.entities.logger import Logger
 from src.entities.losses import isotropic_loss, l1_loss, ssim
-from src.utils.mapper_utils import (calc_psnr, compute_camera_frustum_corners,
-                                    compute_frustum_point_ids,
-                                    compute_new_points_ids,
-                                    compute_opt_views_distribution,
-                                    create_point_cloud, geometric_edge_mask,
-                                    sample_pixels_based_on_gradient)
-from src.utils.utils import (get_render_settings, np2ptcloud, np2torch,
-                             render_gaussian_model, torch2np)
+from src.utils.mapper_utils import (
+    calc_psnr,
+    compute_camera_frustum_corners,
+    compute_frustum_point_ids,
+    compute_new_points_ids,
+    compute_opt_views_distribution,
+    create_point_cloud,
+    geometric_edge_mask,
+    sample_pixels_based_on_gradient,
+)
+from src.utils.utils import (
+    get_render_settings,
+    np2ptcloud,
+    np2torch,
+    render_gaussian_model,
+    torch2np,
+)
 from src.utils.vis_utils import *  # noqa - needed for debugging
 
 
 class Mapper(object):
-    def __init__(self, config: dict, dataset: BaseDataset, logger: Logger) -> None:
+    def __init__(self, config: dict, camera: BaseCamera, dataset: BaseDataset, logger: Logger, filter_cloud: bool = True) -> None:
         """ Sets up the mapper parameters
         Args:
             config: configuration of the mapper
@@ -32,6 +42,7 @@ class Mapper(object):
         """
         self.config = config
         self.logger = logger
+        self.camera = camera
         self.dataset = dataset
         self.iterations = config["iterations"]
         self.new_submap_iterations = config["new_submap_iterations"]
@@ -44,6 +55,7 @@ class Mapper(object):
         self.current_view_opt_iterations = config["current_view_opt_iterations"]
         self.opt = OptimizationParams(ArgumentParser(description="Training script parameters"))
         self.keyframes = []
+        self.filter_cloud = filter_cloud
 
     def compute_seeding_mask(self, gaussian_model: GaussianModel, keyframe: dict, new_submap: bool) -> np.ndarray:
         """
@@ -183,7 +195,7 @@ class Mapper(object):
             int: The number of points added to the submap
         """
         gaussian_points = gaussian_model.get_xyz()
-        camera_frustum_corners = compute_camera_frustum_corners(gt_depth, estimate_c2w, self.dataset.intrinsics)
+        camera_frustum_corners = compute_camera_frustum_corners(gt_depth, estimate_c2w, self.camera.intrinsics)
         reused_pts_ids = compute_frustum_point_ids(
             gaussian_points, np2torch(camera_frustum_corners), device="cuda")
         new_pts_ids = compute_new_points_ids(gaussian_points[reused_pts_ids], np2torch(pts[:, :3]).contiguous(),
@@ -219,14 +231,13 @@ class Mapper(object):
             "color": color_transform(gt_color).cuda(),
             "depth": np2torch(gt_depth, device="cuda"),
             "render_settings": get_render_settings(
-                self.dataset.width, self.dataset.height, self.dataset.intrinsics, estimate_w2c)}
+                self.camera.width, self.camera.height, self.camera.intrinsics, estimate_w2c)}
 
         seeding_mask = self.compute_seeding_mask(gaussian_model, keyframe, is_new_submap)
         pts = self.seed_new_gaussians(
-            gt_color, gt_depth, self.dataset.intrinsics, estimate_c2w, seeding_mask, is_new_submap)
+            gt_color, gt_depth, self.camera.intrinsics, estimate_c2w, seeding_mask, is_new_submap)
 
         filter_cloud = isinstance(self.dataset, (TUM_RGBD, ScanNet)) and not is_new_submap
-
         new_pts_num = self.grow_submap(gt_depth, estimate_c2w, gaussian_model, pts, filter_cloud)
 
         max_iterations = self.iterations
@@ -257,4 +268,46 @@ class Mapper(object):
         # Log the mapping numbers for the current frame
         self.logger.log_mapping_iteration(frame_id, new_pts_num, gaussian_model.get_size(),
                                           optimization_time/max_iterations, opt_dict)
+        return opt_dict
+    
+    
+    def map_inference(self, frame_id: int, gt_color: np.ndarray, gt_depth: np.ndarray, estimate_c2w: np.ndarray, gaussian_model: GaussianModel, is_new_submap: bool) -> dict:
+        """ Calls out the mapping process described in paragraph 3.2
+        The process goes as follows: seed new gaussians -> add to the submap -> optimize the submap
+        Args:
+            frame_id: current keyframe id
+            estimate_c2w (np.ndarray): The estimated camera-to-world transformation matrix of shape (4x4)
+            gaussian_model (GaussianModel): The current Gaussian model of the submap
+            is_new_submap (bool): A boolean flag indicating whether the current frame initiates a new submap
+        Returns:
+            opt_dict: Dictionary with statistics about the optimization process
+        """
+
+
+        estimate_w2c = np.linalg.inv(estimate_c2w)
+
+        color_transform = torchvision.transforms.ToTensor()
+        keyframe = {
+            "color": color_transform(gt_color).cuda(),
+            "depth": np2torch(gt_depth, device="cuda"),
+            "render_settings": get_render_settings(
+                self.camera.width, self.camera.height, self.camera.intrinsics, estimate_w2c)}
+
+        seeding_mask = self.compute_seeding_mask(gaussian_model, keyframe, is_new_submap)
+        pts = self.seed_new_gaussians(
+            gt_color, gt_depth, self.camera.intrinsics, estimate_c2w, seeding_mask, is_new_submap)
+
+
+        self.grow_submap(gt_depth, estimate_c2w, gaussian_model, pts, self.filter_cloud)
+
+        max_iterations = self.iterations
+        if is_new_submap:
+            max_iterations = self.new_submap_iterations
+        start_time = time.time()
+        opt_dict = self.optimize_submap([(frame_id, keyframe)] + self.keyframes, gaussian_model, max_iterations)
+        optimization_time = time.time() - start_time
+        print("Optimization time: ", optimization_time)
+
+        self.keyframes.append((frame_id, keyframe))
+
         return opt_dict

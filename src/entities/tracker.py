@@ -8,27 +8,36 @@ import torchvision
 from scipy.spatial.transform import Rotation as R
 
 from src.entities.arguments import OptimizationParams
-from src.entities.losses import l1_loss
+from src.entities.cameras import BaseCamera
+from src.entities.datasets import BaseDataset
 from src.entities.gaussian_model import GaussianModel
 from src.entities.logger import Logger
-from src.entities.datasets import BaseDataset
+from src.entities.losses import l1_loss
 from src.entities.visual_odometer import VisualOdometer
 from src.utils.gaussian_model_utils import build_rotation
-from src.utils.tracker_utils import (compute_camera_opt_params,
-                                     interpolate_poses, multiply_quaternions,
-                                     transformation_to_quaternion)
-from src.utils.utils import (get_render_settings, np2torch,
-                             render_gaussian_model, torch2np)
+from src.utils.tracker_utils import (
+    compute_camera_opt_params,
+    interpolate_poses,
+    multiply_quaternions,
+    transformation_to_quaternion,
+)
+from src.utils.utils import (
+    get_render_settings,
+    np2torch,
+    render_gaussian_model,
+    torch2np,
+)
 
 
 class Tracker(object):
-    def __init__(self, config: dict, dataset: BaseDataset, logger: Logger) -> None:
+    def __init__(self, config: dict, camera: BaseCamera, dataset: BaseDataset, logger: Logger) -> None:
         """ Initializes the Tracker with a given configuration, dataset, and logger.
         Args:
             config: Configuration dictionary specifying hyperparameters and operational settings.
             dataset: The dataset object providing access to the sequence of frames.
             logger: Logger object for logging the tracking process.
         """
+        self.camera = camera
         self.dataset = dataset
         self.logger = logger
         self.config = config
@@ -45,7 +54,9 @@ class Tracker(object):
         self.odometry_type = self.config["odometry_type"]
         self.help_camera_initialization = self.config["help_camera_initialization"]
         self.init_err_ratio = self.config["init_err_ratio"]
-        self.odometer = VisualOdometer(self.dataset.intrinsics, self.config["odometer_method"])
+        self.odometer = VisualOdometer(self.camera.intrinsics, self.config["odometer_method"])
+        self.last_image = None
+        self.last_depth = None
 
     def compute_losses(self, gaussian_model: GaussianModel, render_settings: dict,
                        opt_cam_rot: torch.Tensor, opt_cam_trans: torch.Tensor,
@@ -136,7 +147,7 @@ class Tracker(object):
         init_rel_w2c = np.linalg.inv(init_rel)
         reference_w2c = last_w2c
         render_settings = get_render_settings(
-            self.dataset.width, self.dataset.height, self.dataset.intrinsics, reference_w2c)
+            self.camera.width, self.camera.height, self.camera.intrinsics, reference_w2c)
         opt_cam_rot, opt_cam_trans = compute_camera_opt_params(init_rel_w2c)
         gaussian_model.training_setup_camera(opt_cam_rot, opt_cam_trans, self.config)
 
@@ -168,7 +179,7 @@ class Tracker(object):
                 opt_cam_rot, opt_cam_trans = compute_camera_opt_params(init_rel_w2c)
                 gaussian_model.training_setup_camera(opt_cam_rot, opt_cam_trans, self.config)
                 render_settings = get_render_settings(
-                    self.dataset.width, self.dataset.height, self.dataset.intrinsics, last_w2c)
+                    self.camera.width, self.camera.height, self.camera.intrinsics, last_w2c)
                 print(f"re-init with odometer for frame {frame_id}")
 
         for iter in range(num_iters):
@@ -212,4 +223,85 @@ class Tracker(object):
 
         final_c2w = torch.inverse(torch.from_numpy(reference_w2c) @ best_w2c)
         final_c2w[-1, :] = torch.tensor([0., 0., 0., 1.], dtype=final_c2w.dtype, device=final_c2w.device)
+        return torch2np(final_c2w)
+
+    def track_inference(self, image: np.array, depth: np.array, gaussian_model: GaussianModel, prev_c2ws: np.ndarray) -> np.ndarray:
+        """
+        Updates the camera pose estimation for the current frame based on the provided image and depth, using either ground truth poses,
+        constant speed assumption, or visual odometry.
+        Args:
+            frame_id: Index of the current frame being processed.
+            gaussian_model: The current Gaussian model of the scene.
+            prev_c2ws: Array containing the camera-to-world transformation matrices for the frames (0, i - 2, i - 1)
+        Returns:
+            The updated camera-to-world transformation matrix for the current frame.
+        """
+
+        if (self.help_camera_initialization or self.odometry_type == "odometer") and self.odometer.last_rgbd is None:
+            self.odometer.update_last_rgbd(self.last_image, self.last_depth)
+
+        if self.odometry_type == "const_speed":
+            init_c2w = interpolate_poses(prev_c2ws[1:])
+        elif self.odometry_type == "odometer":
+            odometer_rel = self.odometer.estimate_rel_pose(image, depth)
+            init_c2w = prev_c2ws[-1] @ odometer_rel
+
+        last_c2w = prev_c2ws[-1]
+        last_w2c = np.linalg.inv(last_c2w)
+        init_rel = init_c2w @ np.linalg.inv(last_c2w)
+        init_rel_w2c = np.linalg.inv(init_rel)
+        reference_w2c = last_w2c
+        render_settings = get_render_settings(
+            self.camera.width, self.camera.height, self.camera.intrinsics, reference_w2c)
+        opt_cam_rot, opt_cam_trans = compute_camera_opt_params(init_rel_w2c)
+        gaussian_model.training_setup_camera(opt_cam_rot, opt_cam_trans, self.config)
+
+        gt_color = self.transform(image).cuda()
+        gt_depth = np2torch(depth, "cuda")
+        depth_mask = gt_depth > 0.0
+        num_iters = self.config["iterations"]
+        current_min_loss = float("inf")
+
+        # Initial loss check
+        color_loss, depth_loss, _, _, _ = self.compute_losses(gaussian_model, render_settings, opt_cam_rot,
+                                                              opt_cam_trans, gt_color, gt_depth, depth_mask)
+        if len(self.frame_color_loss) > 0 and (
+            color_loss.item() > self.init_err_ratio * np.median(self.frame_color_loss)
+            or depth_loss.item() > self.init_err_ratio * np.median(self.frame_depth_loss)
+        ):
+            num_iters *= 2
+            print(f"Higher initial loss, increasing num_iters to {num_iters}")
+            if self.help_camera_initialization and self.odometry_type != "odometer":
+                self.odometer.update_last_rgbd(self.last_image, self.last_depth)
+                odometer_rel = self.odometer.estimate_rel_pose(image, depth)
+                init_c2w = last_c2w @ odometer_rel
+                init_rel = init_c2w @ np.linalg.inv(last_c2w)
+                init_rel_w2c = np.linalg.inv(init_rel)
+                opt_cam_rot, opt_cam_trans = compute_camera_opt_params(init_rel_w2c)
+                gaussian_model.training_setup_camera(opt_cam_rot, opt_cam_trans, self.config)
+                render_settings = get_render_settings(
+                    self.camera.width, self.camera.height, self.camera.intrinsics, last_w2c)
+                print("re-init with odometer.")
+
+        for iter in range(num_iters):
+            color_loss, depth_loss, _, _, _, = self.compute_losses(
+                gaussian_model, render_settings, opt_cam_rot, opt_cam_trans, gt_color, gt_depth, depth_mask)
+
+            total_loss = (self.w_color_loss * color_loss + (1 - self.w_color_loss) * depth_loss)
+            total_loss.backward()
+            gaussian_model.optimizer.step()
+            gaussian_model.optimizer.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                if total_loss.item() < current_min_loss:
+                    current_min_loss = total_loss.item()
+                    best_w2c = torch.eye(4)
+                    best_w2c[:3, :3] = build_rotation(F.normalize(opt_cam_rot[None].clone().detach().cpu()))[0]
+                    best_w2c[:3, 3] = opt_cam_trans.clone().detach().cpu()
+
+
+        final_c2w = torch.inverse(torch.from_numpy(reference_w2c) @ best_w2c)
+        final_c2w[-1, :] = torch.tensor([0., 0., 0., 1.], dtype=final_c2w.dtype, device=final_c2w.device) 
+        self.last_image = image
+        self.last_depth = depth
         return torch2np(final_c2w)
